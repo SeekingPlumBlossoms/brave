@@ -1,50 +1,47 @@
 package brave.internal.recorder;
 
 import brave.Clock;
-import brave.Span;
-import brave.internal.HexCodec;
-import brave.propagation.TraceContext;
+import brave.Span.Kind;
+import java.util.ArrayList;
+import java.util.List;
 import zipkin2.Endpoint;
+import zipkin2.Span;
 
+/**
+ * One of these objects is allocated for each in-flight span, so we try to be parsimonious on things
+ * like array allocation and object reference size.
+ */
 final class MutableSpan {
   final Clock clock;
-  final zipkin2.Span.Builder span;
-  long timestamp;
+  int kindIndex = -1;
+  boolean shared;
+  long timestamp, duration;
+  String name;
+  Endpoint remoteEndpoint;
+  /**
+   * To reduce the amount of allocation, collocate annotations with tags in a pair-indexed list.
+   * This will be (timestamp, value) for annotations and (key, value) for tags.
+   */
+  List<Object> pairs = new ArrayList<>(4); // assume 2 tags and no annotations
 
-  // Since this is not exposed, this class could be refactored later as needed to act in a pool
-  // to reduce GC churn. This would involve calling span.clear and resetting the fields below.
-  MutableSpan(Clock clock, TraceContext context) {
+  MutableSpan(Clock clock) {
     this.clock = clock;
-    long parentId = context.parentIdAsLong();
-    this.span = zipkin2.Span.newBuilder()
-        .traceId(context.traceIdString())
-        .parentId(parentId != 0L ? HexCodec.toLowerHex(parentId) : null)
-        .id(HexCodec.toLowerHex(context.spanId()))
-        .debug(context.debug() ? true : null);
   }
 
   void start() {
     start(clock.currentTimeMicroseconds());
   }
 
-  synchronized void setShared() {
-    span.shared(true);
-  }
-
   synchronized void start(long timestamp) {
-    span.timestamp(this.timestamp = timestamp);
+    this.timestamp = timestamp;
   }
 
   synchronized void name(String name) {
-    span.name(name);
+    this.name = name;
   }
 
-  synchronized void kind(Span.Kind kind) {
-    try {
-      span.kind(zipkin2.Span.Kind.valueOf(kind.name()));
-    } catch (IllegalArgumentException e) {
-      // TODO: log
-    }
+  synchronized void kind(Kind kind) {
+    this.kindIndex = kind.ordinal();
   }
 
   void annotate(String value) {
@@ -52,37 +49,65 @@ final class MutableSpan {
   }
 
   synchronized void annotate(long timestamp, String value) {
+    // Modern instrumentation should not send annotations such as this, but we leniently
+    // accept them rather than fail.
     if ("cs".equals(value)) {
-      span.kind(zipkin2.Span.Kind.CLIENT).timestamp(this.timestamp = timestamp);
+      kind(Kind.CLIENT);
+      this.timestamp = timestamp;
     } else if ("sr".equals(value)) {
-      span.kind(zipkin2.Span.Kind.SERVER).timestamp(this.timestamp = timestamp);
+      kind(Kind.SERVER);
+      this.timestamp = timestamp;
     } else if ("cr".equals(value)) {
-      span.kind(zipkin2.Span.Kind.CLIENT);
+      kind(Kind.CLIENT);
       finish(timestamp);
     } else if ("ss".equals(value)) {
-      span.kind(zipkin2.Span.Kind.SERVER);
+      kind(Kind.SERVER);
       finish(timestamp);
     } else {
-      span.addAnnotation(timestamp, value);
+      pairs.add(timestamp);
+      pairs.add(value);
     }
   }
 
   synchronized void tag(String key, String value) {
-    span.putTag(key, value);
+    pairs.add(key);
+    pairs.add(value);
   }
 
   synchronized void remoteEndpoint(Endpoint remoteEndpoint) {
-    span.remoteEndpoint(remoteEndpoint);
+    this.remoteEndpoint = remoteEndpoint;
   }
 
-  /** Completes and reports the span */
+  synchronized void setShared() {
+    shared = true;
+  }
+
+  /** Completes the span */
   synchronized void finish(long finishTimestamp) {
-    if (timestamp != 0L && finishTimestamp != 0L) {
-      span.duration(Math.max(finishTimestamp - timestamp, 1));
+    if (timestamp != 0 && finishTimestamp != 0L) {
+      duration = Math.max(finishTimestamp - timestamp, 1);
     }
   }
 
-  synchronized zipkin2.Span toSpan(Endpoint localEndpoint) {
-    return span.localEndpoint(localEndpoint).build();
+  // Since this is not exposed, this class could be refactored later as needed to act in a pool
+  // to reduce GC churn. This would involve calling span.clear and resetting the fields below.
+  synchronized void writeTo(zipkin2.Span.Builder result) {
+    result.remoteEndpoint(remoteEndpoint);
+    result.name(name);
+    result.timestamp(timestamp);
+    result.duration(duration);
+    if (kindIndex != -1 && kindIndex < Span.Kind.values().length) { // defend against version skew
+      result.kind(zipkin2.Span.Kind.values()[kindIndex]);
+    }
+    for (int i = 0, length = pairs.size(); i < length; i += 2) {
+      Object first = pairs.get(i);
+      String second = pairs.get(i + 1).toString();
+      if (first instanceof Long) {
+        result.addAnnotation((Long) first, second);
+      } else {
+        result.putTag(first.toString(), second);
+      }
+    }
+    if (shared) result.shared(true);
   }
 }

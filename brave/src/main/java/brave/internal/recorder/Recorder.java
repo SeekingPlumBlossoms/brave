@@ -6,6 +6,7 @@ import brave.Tracer;
 import brave.propagation.TraceContext;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import zipkin2.Endpoint;
 import zipkin2.reporter.Reporter;
@@ -109,20 +110,27 @@ public final class Recorder {
   public void finish(TraceContext context) {
     MutableSpan span = spanMap.remove(context);
     if (span == null || noop.get()) return;
+    long finishTimestamp = span.clock.currentTimeMicroseconds();
+    zipkin2.Span.Builder toReport = zipkin2.Span.newBuilder();
+    writeTo(context, toReport);
     synchronized (span) {
-      span.finish(span.clock.currentTimeMicroseconds());
-      reporter.report(span.toSpan(endpoint));
+      span.finish(finishTimestamp);
+      span.writeTo(toReport);
     }
+    report(context, toReport);
   }
 
   /** @see Span#finish(long) */
   public void finish(TraceContext context, long finishTimestamp) {
     MutableSpan span = spanMap.remove(context);
     if (span == null || noop.get()) return;
+    zipkin2.Span.Builder toReport = zipkin2.Span.newBuilder();
+    writeTo(context, toReport);
     synchronized (span) {
       span.finish(finishTimestamp);
-      reporter.report(span.toSpan(endpoint));
+      span.writeTo(toReport);
     }
+    report(context, toReport);
   }
 
   /** @see Span#abandon() */
@@ -134,17 +142,38 @@ public final class Recorder {
   public void flush(TraceContext context) {
     MutableSpan span = spanMap.remove(context);
     if (span == null || noop.get()) return;
+    zipkin2.Span.Builder toReport = zipkin2.Span.newBuilder();
+    writeTo(context, toReport);
     synchronized (span) {
-      span.finish(0L);
-      reporter.report(span.toSpan(endpoint));
+      span.writeTo(toReport);
     }
+    report(context, toReport);
+  }
+
+  /** Sends to the normal reporter, provided it is sampled */
+  void report(TraceContext context, zipkin2.Span.Builder toReport) {
+    if (Boolean.TRUE.equals(context.sampled())) {
+      reporter.report(toReport.build());
+    }
+  }
+
+  void writeTo(TraceContext context, zipkin2.Span.Builder builder) {
+    builder.traceId(context.traceIdHigh(), context.traceId())
+        .parentId(context.parentIdAsLong())
+        .id(context.spanId())
+        .debug(context.debug())
+        .localEndpoint(endpoint);
   }
 
   /** Exposes which spans are in-flight, mostly for testing. */
   public List<zipkin2.Span> snapshot() {
     List<zipkin2.Span> result = new ArrayList<>();
-    for (MutableSpan value : spanMap.delegate.values()) {
-      result.add(value.toSpan(endpoint));
+    zipkin2.Span.Builder spanBuilder = zipkin2.Span.newBuilder();
+    for (Map.Entry<Object, MutableSpan> entry : spanMap.delegate.entrySet()) {
+      spanMap.writeTo((MutableSpanMap.RealKey) entry.getKey(), spanBuilder);
+      entry.getValue().writeTo(spanBuilder);
+      result.add(spanBuilder.build());
+      spanBuilder.clear();
     }
     return result;
   }

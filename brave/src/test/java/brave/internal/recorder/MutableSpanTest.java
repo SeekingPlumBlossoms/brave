@@ -1,7 +1,6 @@
 package brave.internal.recorder;
 
 import brave.Span.Kind;
-import brave.internal.Platform;
 import brave.propagation.TraceContext;
 import org.junit.Test;
 import zipkin2.Annotation;
@@ -13,9 +12,6 @@ import static brave.Span.Kind.SERVER;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public class MutableSpanTest {
-  Endpoint localEndpoint = Platform.get().endpoint();
-  TraceContext context = TraceContext.newBuilder().traceId(1).spanId(2).build();
-
   @Test public void minimumDurationIsOne() {
     MutableSpan span = newSpan();
 
@@ -103,7 +99,7 @@ public class MutableSpanTest {
     flush(Kind.CONSUMER, Span.Kind.CONSUMER);
   }
 
-  private void flush(Kind braveKind, Span.Kind span2Kind) {
+  void flush(Kind braveKind, Span.Kind span2Kind) {
     MutableSpan span = newSpan();
     span.kind(braveKind);
     span.start(1L);
@@ -131,7 +127,7 @@ public class MutableSpanTest {
 
   // This prevents the server timestamp from overwriting the client one on the collector
   @Test public void reportsSharedStatus() {
-    MutableSpan span = new MutableSpan(() -> 0L, context);
+    MutableSpan span = new MutableSpan(() -> 0L);
 
     span.setShared();
     span.start(1L);
@@ -145,7 +141,8 @@ public class MutableSpanTest {
   @Test public void flushUnstartedNeitherSetsTimestampNorDuration() {
     MutableSpan flushed = newSpan();
     flushed.finish(0L);
-    assertThat(flushed).extracting(s -> s.timestamp, s -> toZipkinSpan(s).durationAsLong())
+
+    assertThat(flushed).extracting(s -> s.timestamp, s -> s.duration)
         .allSatisfy(u -> assertThat(u).isEqualTo(0L));
   }
 
@@ -165,10 +162,12 @@ public class MutableSpanTest {
   }
 
   MutableSpan newSpan() {
-    return new MutableSpan(() -> 0L, context);
+    return new MutableSpan(() -> 0L);
   }
 
   Span toZipkinSpan(MutableSpan span) {
-    return span.toSpan(localEndpoint);
+    Span.Builder result = Span.newBuilder().traceId(0L, 1L).id(1L);
+    span.writeTo(result);
+    return result.build();
   }
 }

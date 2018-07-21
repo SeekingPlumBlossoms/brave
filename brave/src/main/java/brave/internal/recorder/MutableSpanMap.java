@@ -3,7 +3,6 @@ package brave.internal.recorder;
 import brave.Clock;
 import brave.internal.Nullable;
 import brave.propagation.TraceContext;
-import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.util.concurrent.ConcurrentHashMap;
@@ -12,6 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import zipkin2.Endpoint;
+import zipkin2.Span;
 import zipkin2.reporter.Reporter;
 
 /**
@@ -63,7 +63,7 @@ final class MutableSpanMap extends ReferenceQueue<TraceContext> {
       clock = new TickClock(this.clock.currentTimeMicroseconds(), System.nanoTime());
     }
 
-    MutableSpan newSpan = new MutableSpan(clock, context);
+    MutableSpan newSpan = new MutableSpan(clock);
     MutableSpan previousSpan = delegate.putIfAbsent(new RealKey(context, this), newSpan);
     if (previousSpan != null) return previousSpan; // lost race
     return newSpan;
@@ -86,19 +86,44 @@ final class MutableSpanMap extends ReferenceQueue<TraceContext> {
 
   /** Reports spans orphaned by garbage collection. */
   void reportOrphanedSpans() {
-    Reference<? extends TraceContext> reference;
-    while ((reference = poll()) != null) {
-      TraceContext context = reference.get();
-      MutableSpan value = delegate.remove(reference);
-      if (value == null || noop.get()) continue;
-      try {
-        value.annotate(value.clock.currentTimeMicroseconds(), "brave.flush");
-        reporter.report(value.toSpan(endpoint));
-      } catch (RuntimeException e) {
-        // don't crash the caller if there was a problem reporting an unrelated span.
-        if (context != null && logger.isLoggable(Level.FINE)) {
-          logger.log(Level.FINE, "error flushing " + context, e);
-        }
+    RealKey contextKey;
+    // This is called on critical path of unrelated traced operations. If we have orphaned spans, be
+    // careful to not penalize the performance of the caller. It is better to slightly inaccurate
+    // cached time when flushing a span than hurt performance of unrelated operations by calling
+    // currentTimeMicroseconds N times
+    Span.Builder builder = null;
+    long flushTime = 0;
+    while ((contextKey = (RealKey) poll()) != null) {
+      MutableSpan value = delegate.remove(contextKey);
+      if (value == null || noop.get() || !contextKey.sampled) continue;
+      if (builder != null) {
+        builder.clear();
+      } else {
+        builder = Span.newBuilder();
+        flushTime = clock.currentTimeMicroseconds();
+      }
+      writeTo(contextKey, builder);
+      value.annotate(flushTime, "brave.flush");
+      value.writeTo(builder);
+      report(builder.build());
+    }
+  }
+
+  void writeTo(RealKey contextKey, zipkin2.Span.Builder builder) {
+    builder.traceId(contextKey.traceIdHigh, contextKey.traceId)
+        .parentId(contextKey.parentId)
+        .id(contextKey.spanId)
+        .debug(contextKey.debug)
+        .localEndpoint(endpoint);
+  }
+
+  void report(Span span) {
+    try {
+      reporter.report(span);
+    } catch (RuntimeException e) {
+      // don't crash the caller if there was a problem reporting an unrelated span.
+      if (logger.isLoggable(Level.FINE)) {
+        logger.log(Level.FINE, "error flushing " + span, e);
       }
     }
   }
@@ -113,9 +138,19 @@ final class MutableSpanMap extends ReferenceQueue<TraceContext> {
   static final class RealKey extends WeakReference<TraceContext> {
     final int hashCode;
 
+    // Copy the identity fields from the trace context, so we can use them when the reference clears
+    final long traceIdHigh, traceId, parentId, spanId;
+    final boolean sampled, debug;
+
     RealKey(TraceContext context, ReferenceQueue<TraceContext> queue) {
       super(context, queue);
       hashCode = context.hashCode();
+      traceIdHigh = context.traceIdHigh();
+      traceId = context.traceId();
+      parentId = context.parentIdAsLong();
+      spanId = context.spanId();
+      sampled = Boolean.TRUE.equals(context.sampled());
+      debug = context.debug();
     }
 
     @Override public String toString() {
